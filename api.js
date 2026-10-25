@@ -1,5 +1,5 @@
 // =====================================================
-// CheddaBoards HTTP API Proxy v1.11.1
+// CheddaBoards HTTP API Proxy v1.11.2
 // Per-Game OAuth Credentials + Time-Based Scoreboards + Archives
 // + Play Session Time Validation + Batch Achievement Unlocks
 // + End Play Sessions + Account Migration
@@ -26,12 +26,12 @@ import QRCode from "qrcode";
 const CANISTER_ID = process.env.CANISTER_ID;
 if (!CANISTER_ID) throw new Error("CANISTER_ID environment variable is required");
 const ICP_HOST = process.env.ICP_HOST || "https://icp-api.io";
-const API_VERSION = "1.11.1";
+const API_VERSION = "1.11.2";
 // BUILD_STAMP changes on every edit. Hit /health after deploying: if the stamp
 // you see live doesn't match this, the deploy did NOT take effect (stale bundle
 // / cached function / wrong folder). This makes "did it actually redeploy?" a
 // one-glance check instead of guesswork.
-const BUILD_STAMP = "PUBLIC-RELEASE-v1-2026-10-25";
+const BUILD_STAMP = "PLATFORM-AUDIENCE-ONLY-v1-2026-10-25";
 logJson("[CheddaAPI] MODULE LOADED build=" + BUILD_STAMP, { evt: "module_loaded", build: BUILD_STAMP });
 
 // Log hygiene: request paths and IDs are attacker-controlled — strip
@@ -920,18 +920,16 @@ async function handleGoogleAuth(actor, body, gameId) {
     return error(400, "Missing game ID. Include X-Game-ID header or gameId in body.");
   }
   
-  const oauthConfig = await getGameOAuthConfig(actor, gameId);
-  
+  // SECURITY 2026-10-25 (audit C1): sessions are keyed on email and not
+  // scoped to a game, so accepting a developer-registered client ID let any
+  // developer turn a Google login on their own site into a CheddaBoards
+  // session for that user. Only CheddaBoards' own client IDs are accepted.
   let allowedClientIds = [];
   
-  if (oauthConfig && oauthConfig.googleClientIds && oauthConfig.googleClientIds.length > 0) {
-    allowedClientIds = oauthConfig.googleClientIds;
-    console.log(`[Google] Using game credentials for ${gameId}:`, allowedClientIds.length, "client IDs");
-  } else if (FALLBACK_GOOGLE_CLIENT_IDS.length > 0) {
+  if (FALLBACK_GOOGLE_CLIENT_IDS.length > 0) {
     allowedClientIds = FALLBACK_GOOGLE_CLIENT_IDS;
-    console.log(`[Google] Using fallback credentials for ${gameId}`);
   } else {
-    return error(400, "Google Sign-In not configured for this game. Add your Google client IDs in the CheddaBoards dashboard.");
+    return error(400, "Google Sign-In is not configured on this server (set GOOGLE_CLIENT_IDS).");
   }
   
   const verification = await verifyGoogleToken(idToken, allowedClientIds);
@@ -996,18 +994,13 @@ async function handleAppleAuth(actor, body, gameId) {
     return error(400, "Missing game ID. Include X-Game-ID header or gameId in body.");
   }
   
-  const oauthConfig = await getGameOAuthConfig(actor, gameId);
-  
+  // SECURITY 2026-10-25 (audit C1): platform bundle ID only, see handleGoogleAuth.
   let allowedBundleId = null;
   
-  if (oauthConfig && oauthConfig.appleBundleId) {
-    allowedBundleId = oauthConfig.appleBundleId;
-    console.log(`[Apple] Using game credentials for ${gameId}: ${allowedBundleId}`);
-  } else if (FALLBACK_APPLE_BUNDLE_ID) {
+  if (FALLBACK_APPLE_BUNDLE_ID) {
     allowedBundleId = FALLBACK_APPLE_BUNDLE_ID;
-    console.log(`[Apple] Using fallback credentials for ${gameId}`);
   } else {
-    return error(400, "Apple Sign-In not configured for this game. Add your Apple bundle ID in the CheddaBoards dashboard.");
+    return error(400, "Apple Sign-In is not configured on this server (set APPLE_BUNDLE_ID).");
   }
   
   const verification = await verifyAppleToken(identityToken, allowedBundleId);
@@ -1605,12 +1598,8 @@ async function handleDeviceCodeApprove(actor, body) {
       allowedClientIds = FALLBACK_GOOGLE_CLIENT_IDS;
     }
     
-    // Also accept the game's registered client IDs (in case a dev
-    // embeds the approve flow in their own page with their own credentials)
-    const oauthConfig = await getGameOAuthConfig(actor, gameId);
-    if (oauthConfig?.googleClientIds?.length > 0) {
-      allowedClientIds = [...new Set([...allowedClientIds, ...oauthConfig.googleClientIds])];
-    }
+    // SECURITY 2026-10-25 (audit C1): the game's own client IDs are no
+    // longer merged in here; only CheddaBoards' link-page IDs are accepted.
     
     if (allowedClientIds.length === 0) {
       return error(400, "Google Sign-In not configured. Set DEVICE_AUTH_GOOGLE_CLIENT_ID.");
@@ -1683,12 +1672,8 @@ async function handleDeviceCodeApprove(actor, body) {
       allowedBundleId = DEVICE_AUTH_APPLE_BUNDLE_ID;
     } else if (FALLBACK_APPLE_BUNDLE_ID) {
       allowedBundleId = FALLBACK_APPLE_BUNDLE_ID;
-    } else {
-      const oauthConfig = await getGameOAuthConfig(actor, gameId);
-      if (oauthConfig?.appleBundleId) {
-        allowedBundleId = oauthConfig.appleBundleId;
-      }
     }
+    // SECURITY 2026-10-25 (audit C1): no per-game bundle ID fallback.
     
     if (!allowedBundleId) {
       return error(400, "Apple Sign-In not configured. Set DEVICE_AUTH_APPLE_BUNDLE_ID.");
@@ -3491,6 +3476,14 @@ async function handleRequest(event) {
     // =====================================================
     // OAUTH MANAGEMENT ROUTES
     // =====================================================
+    
+    // SECURITY 2026-10-25 (audit C1): per-game OAuth credentials are retired.
+    // No game had any set (census 2026-10-25), and the auth handlers no longer
+    // read them, so registering new ones is refused rather than silently ignored.
+    if (method === "POST" && pathParts[0] === "games" && pathParts[2] === "oauth" &&
+        (pathParts[3] === "google" || pathParts[3] === "apple")) {
+      return error(410, "Per-game OAuth credentials are no longer supported. Players sign in through the CheddaBoards link page.");
+    }
     
     if (method === "POST" && pathParts[0] === "games" && pathParts[2] === "oauth" && pathParts[3] === "google") {
       const gameId = pathParts[1];
