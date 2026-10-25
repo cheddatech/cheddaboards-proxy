@@ -1,0 +1,27 @@
+{
+  "name": "cheddaboards-proxy",
+  "version": "1.11.1",
+  "description": "REST API proxy in front of the CheddaBoards leaderboard canister on the Internet Computer",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cheddatech/cheddaboards-proxy.git"
+  },
+  "license": "MIT",
+  "author": "CheddaTech Ltd",
+  "dependencies": {
+    "@dfinity/agent": "^2.4.1",
+    "@dfinity/candid": "^2.4.1",
+    "@dfinity/identity": "^2.4.1",
+    "@dfinity/principal": "^2.4.1",
+    "jose": "^5.10.0",
+    "qrcode": "^1.5.4"
+  }
+}
