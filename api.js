@@ -1,5 +1,5 @@
 // =====================================================
-// CheddaBoards HTTP API Proxy v1.11.2
+// CheddaBoards HTTP API Proxy v1.11.3
 // Per-Game OAuth Credentials + Time-Based Scoreboards + Archives
 // + Play Session Time Validation + Batch Achievement Unlocks
 // + End Play Sessions + Account Migration
@@ -26,12 +26,12 @@ import QRCode from "qrcode";
 const CANISTER_ID = process.env.CANISTER_ID;
 if (!CANISTER_ID) throw new Error("CANISTER_ID environment variable is required");
 const ICP_HOST = process.env.ICP_HOST || "https://icp-api.io";
-const API_VERSION = "1.11.2";
+const API_VERSION = "1.11.3";
 // BUILD_STAMP changes on every edit. Hit /health after deploying: if the stamp
 // you see live doesn't match this, the deploy did NOT take effect (stale bundle
 // / cached function / wrong folder). This makes "did it actually redeploy?" a
 // one-glance check instead of guesswork.
-const BUILD_STAMP = "PLATFORM-AUDIENCE-ONLY-v1-2026-10-25";
+const BUILD_STAMP = "SOCIAL-AUTH-LIMITS-v1-2026-10-25";
 logJson("[CheddaAPI] MODULE LOADED build=" + BUILD_STAMP, { evt: "module_loaded", build: BUILD_STAMP });
 
 // Log hygiene: request paths and IDs are attacker-controlled — strip
@@ -305,6 +305,22 @@ const LIMIT_DEVICE_CODE_PER_IP_HOUR = envInt("LIMIT_DEVICE_CODE_PER_IP_HOUR", 30
 const LIMIT_DEVICE_APPROVE_PER_IP_HOUR = envInt("LIMIT_DEVICE_APPROVE_PER_IP_HOUR", 30);
 const LIMIT_DEVICE_STATUS_PER_IP_MIN = envInt("LIMIT_DEVICE_STATUS_PER_IP_MIN", 60);
 const LIMIT_UPGRADE_REQ_PER_IP_HOUR = envInt("LIMIT_UPGRADE_REQ_PER_IP_HOUR", 5);
+// SECURITY (v1.11.3): Google/Apple sign-in had no route limit, so one valid ID
+// token could be replayed to mint unlimited 30-day canister sessions. Two
+// budgets: per client IP before any verification work, and per provider
+// account (sub) after the token verifies. Covers dashboard sign-in and
+// device-code approval.
+const LIMIT_SOCIAL_AUTH_PER_IP_HOUR = envInt("LIMIT_SOCIAL_AUTH_PER_IP_HOUR", 30);
+const LIMIT_SOCIAL_AUTH_PER_ACCOUNT_HOUR = envInt("LIMIT_SOCIAL_AUTH_PER_ACCOUNT_HOUR", 20);
+
+// An empty client IP used to skip the limit entirely (routeLimit ignores empty
+// keys). For auth routes, requests with no resolvable IP share one bucket.
+function socialIpKey(ip) { return ip || "no-ip"; }
+
+function socialAccountLimit(provider, sub) {
+  if (!sub) return null;
+  return routeLimit("social_acct", `${provider}:${sub}`, LIMIT_SOCIAL_AUTH_PER_ACCOUNT_HOUR, 3600000);
+}
 const LIMIT_SESSION_PLAY_PER_SESSION_HOUR = envInt("LIMIT_SESSION_PLAY_PER_SESSION_HOUR", 240);
 const LIMIT_ACHIEVEMENT_CALLS_PER_PLAYER_HOUR = envInt("LIMIT_ACHIEVEMENT_CALLS_PER_PLAYER_HOUR", 120);
 const MAX_ACHIEVEMENTS_PER_REQUEST = envInt("MAX_ACHIEVEMENTS_PER_REQUEST", 100);
@@ -939,6 +955,8 @@ async function handleGoogleAuth(actor, body, gameId) {
   }
   
   const googleUser = verification.user;
+  const acctLimited = socialAccountLimit("google", googleUser.sub);
+  if (acctLimited) return acctLimited;
   
   if (!googleUser.email) {
     return error(400, "Google account has no email associated");
@@ -1010,6 +1028,8 @@ async function handleAppleAuth(actor, body, gameId) {
   }
   
   const appleUser = verification.user;
+  const acctLimited = socialAccountLimit("apple", appleUser.sub);
+  if (acctLimited) return acctLimited;
   
   // SECURITY-AUDIT 2026-10-25: the email comes ONLY from the signed token.
   // This used to fall back to body.user.email, which the client controls, so
@@ -1611,6 +1631,8 @@ async function handleDeviceCodeApprove(actor, body) {
     }
     
     const googleUser = verification.user;
+    const acctLimited = socialAccountLimit("google", googleUser.sub);
+    if (acctLimited) return acctLimited;
     if (!googleUser.email) {
       return error(400, "Google account has no email associated");
     }
@@ -1685,6 +1707,8 @@ async function handleDeviceCodeApprove(actor, body) {
     }
     
     const appleUser = verification.user;
+    const acctLimited = socialAccountLimit("apple", appleUser.sub);
+    if (acctLimited) return acctLimited;
     const email = (appleUser.email && appleUser.emailVerified)
       ? appleUser.email
       : `apple_${appleUser.sub}@privaterelay.appleid.com`;
@@ -3016,10 +3040,14 @@ async function handleRequest(event) {
     // =====================================================
     
     if (method === "POST" && pathParts[0] === "auth" && pathParts[1] === "google") {
+      const limited = routeLimit("social_ip", socialIpKey(clientIp), LIMIT_SOCIAL_AUTH_PER_IP_HOUR, 3600000);
+      if (limited) return limited;
       return await handleGoogleAuth(actor, body, gameIdHeader || body.gameId);
     }
     
     if (method === "POST" && pathParts[0] === "auth" && pathParts[1] === "apple") {
+      const limited = routeLimit("social_ip", socialIpKey(clientIp), LIMIT_SOCIAL_AUTH_PER_IP_HOUR, 3600000);
+      if (limited) return limited;
       return await handleAppleAuth(actor, body, gameIdHeader || body.gameId);
     }
     
