@@ -778,7 +778,8 @@ const error = (code, message, extraHeaders = {}) =>
 // touch, so returning players see "not found" rather than "expired".
 const sessionErrorStatus = (err) =>
   (typeof err === "string" &&
-   (err.startsWith("Invalid session") || err.startsWith("Session expired")))
+   (err.startsWith("Invalid session") ||
+    (err.startsWith("Session expired") && !err.includes("Start a new game"))))
     ? 401 : 400;
 
 // Log-hygiene: never print raw user emails in function logs (they persist in
