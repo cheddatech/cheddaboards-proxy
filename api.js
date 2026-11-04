@@ -1,5 +1,5 @@
 // =====================================================
-// CheddaBoards HTTP API Proxy v1.11.3
+// CheddaBoards HTTP API Proxy v1.11.4
 // Per-Game OAuth Credentials + Time-Based Scoreboards + Archives
 // + Play Session Time Validation + Batch Achievement Unlocks
 // + End Play Sessions + Account Migration
@@ -9,6 +9,8 @@
 // + Fan-Out Board Submit Conversion + Helpful Unknown-Route 404s
 // + Security audit fixes (2026-10-25): verified-email-only social login,
 //   safe upgrade requests, real client IP, limits on unauthenticated routes
+// + Reject logging (2026-11-04): ip + trace on every request log line,
+//   counted cap rejects, board-create rejects, play-session tier rejects
 // =====================================================
 
 import { Actor, HttpAgent } from "@dfinity/agent";
@@ -26,12 +28,36 @@ import QRCode from "qrcode";
 const CANISTER_ID = process.env.CANISTER_ID;
 if (!CANISTER_ID) throw new Error("CANISTER_ID environment variable is required");
 const ICP_HOST = process.env.ICP_HOST || "https://icp-api.io";
-const API_VERSION = "1.11.3";
+const API_VERSION = "1.11.4";
 // BUILD_STAMP changes on every edit. Hit /health after deploying: if the stamp
 // you see live doesn't match this, the deploy did NOT take effect (stale bundle
 // / cached function / wrong folder). This makes "did it actually redeploy?" a
 // one-glance check instead of guesswork.
-const BUILD_STAMP = "SOCIAL-AUTH-LIMITS-v1-2026-10-25";
+const BUILD_STAMP = "REJECT-LOGGING-v1-2026-11-04";
+
+// Per-request context (origin, client IP, trace). Declared here, before the
+// first logJson call below, because logJson reads it and a const used before
+// its declaration throws. See requestContext notes further down (CORS fix).
+const requestContext = new AsyncLocalStorage();
+
+// Cloud Logging only links a stdout line to its request (and to the
+// run_googleapis_com_requests table) when the line carries
+// "logging.googleapis.com/trace" in projects/<id>/traces/<traceId> form.
+// Set GOOGLE_CLOUD_PROJECT on the service if you self-host under another ID.
+const TRACE_PROJECT = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCP_PROJECT || "cheddaboards-proxy";
+function traceFromHeaders(headers) {
+  const h = headers || {};
+  const xct = h["x-cloud-trace-context"] || h["X-Cloud-Trace-Context"];
+  let id = xct ? String(xct).split("/")[0] : "";
+  if (!id) {
+    // W3C traceparent: version-traceid-spanid-flags
+    const tp = h["traceparent"] || h["Traceparent"];
+    const parts = tp ? String(tp).split("-") : [];
+    if (parts.length >= 2) id = parts[1];
+  }
+  return /^[0-9a-f]{32}$/i.test(id) ? `projects/${TRACE_PROJECT}/traces/${id}` : null;
+}
+
 logJson("[CheddaAPI] MODULE LOADED build=" + BUILD_STAMP, { evt: "module_loaded", build: BUILD_STAMP });
 
 // Log hygiene: request paths and IDs are attacker-controlled — strip
@@ -95,8 +121,20 @@ function parseLimit(query) {
 // into jsonPayload (filterable: jsonPayload.game, jsonPayload.evt, ...) with
 // severity; on Netlify they render as plain JSON text (still greppable).
 // logError() below is the ERROR-severity twin: same JSON shape, on stderr.
+// Every line logged inside a request also carries that request's client IP
+// (unless the line sets its own) and its trace, so submit and reject lines
+// can be grouped by IP and joined to the request logs without guesswork.
+function logContextFields() {
+  const ctx = requestContext.getStore();
+  if (!ctx) return {};
+  const out = {};
+  if (ctx.ip) out.ip = ctx.ip;
+  if (ctx.trace) out["logging.googleapis.com/trace"] = ctx.trace;
+  return out;
+}
+
 function logJson(message, fields = {}) {
-  console.log(JSON.stringify({ severity: "INFO", message, ...fields }));
+  console.log(JSON.stringify({ severity: "INFO", message, ...logContextFields(), ...fields }));
 }
 
 // Structured error line: severity ERROR to stderr (Cloud Run tags it ERROR and
@@ -104,7 +142,7 @@ function logJson(message, fields = {}) {
 // requestId out as hex when present so a gateway failure is traceable, instead
 // of console.error dumping it as "[object ArrayBuffer]". Pass the caught error.
 function logError(message, err, fields = {}) {
-  const entry = { severity: "ERROR", message, err: err && (err.message || String(err)), ...fields };
+  const entry = { severity: "ERROR", message, err: err && (err.message || String(err)), ...logContextFields(), ...fields };
   const rid = err && (err.requestId ?? (err.response && err.response.requestId));
   if (rid != null) {
     try {
@@ -267,10 +305,16 @@ const WRITE_GUARD_MAX_ENTRIES = 5000;
 //      because one phone at ~17/min never reaches 60. One player ID doing
 //      more than two submits a minute for an hour straight is a timer, not a
 //      person. This is what makes the per-key tier limit safe to raise.
-// Every reject logs evt=submit_cap_reject with scope/game/ip so the daily
+//      RAISED 120 -> 500 (2026-11-04): YAJUZOU, a quick-retry arcade game,
+//      had real players doing 4+ runs a minute; at 120/hr the cap was
+//      throttling the game's most engaged players, not bots. 500/hr is
+//      ~8/min sustained, still far below a timer, and the 2s write guard
+//      already stops tight loops.
+// Rejects log evt=submit_cap_reject with scope/game/ip (see rejectLogDue for
+// how often) so the daily
 // summaries show it. Limits are env vars so they tune without a deploy.
 const SUBMIT_CAP_IP_PER_MIN = parseInt(process.env.SUBMIT_CAP_IP_PER_MIN || "60", 10);
-const SUBMIT_CAP_PLAYER_PER_HOUR = parseInt(process.env.SUBMIT_CAP_PLAYER_PER_HOUR || "120", 10);
+const SUBMIT_CAP_PLAYER_PER_HOUR = parseInt(process.env.SUBMIT_CAP_PLAYER_PER_HOUR || "500", 10);
 const PAUSED_GAMES = new Set((process.env.PAUSED_GAMES || "").split(",").map(s => s.trim()).filter(Boolean));
 const submitIpWindows = new Map();       // ip -> { start: ms, count }
 const submitPlayerWindows = new Map();   // "game:player" -> { start: ms, count }
@@ -327,6 +371,17 @@ const MAX_ACHIEVEMENTS_PER_REQUEST = envInt("MAX_ACHIEVEMENTS_PER_REQUEST", 100)
 const routeWindows = new Map();          // "scope:key" -> { start: ms, count }
 const ROUTE_WINDOW_MAX_ENTRIES = 20000;
 
+// Which rejects in a window get a log line. Logging only the first one hid
+// how bad a burst was: on 4 Nov 2026 the request log showed 100 429s in one
+// hour against 3 log lines, and it took an hour of joins to attribute them.
+// Logging every reject would let a runaway client write a line per request,
+// so: the first reject, then every REJECT_LOG_EVERY-th, each carrying the
+// running count. Sum or max `rejected` per window to see the real total.
+const REJECT_LOG_EVERY = envInt("REJECT_LOG_EVERY", 25);
+function rejectLogDue(rejected) {
+  return rejected === 1 || (REJECT_LOG_EVERY > 0 && rejected % REJECT_LOG_EVERY === 0);
+}
+
 // Returns null when allowed, otherwise a ready-to-return 429. Missing key
 // (no client IP) is allowed through rather than lumping everyone together.
 function routeLimit(scope, key, max, windowMs) {
@@ -343,8 +398,8 @@ function routeLimit(scope, key, max, windowMs) {
   w.count += 1;
   if (w.count <= max) return null;
   const retry = Math.max(1, Math.ceil((windowMs - (now - w.start)) / 1000));
-  if (w.count === max + 1) {
-    logJson(`[CheddaAPI] route limit ${scope}`, { evt: "route_limit_reject", scope, key: cleanForLog(key), cap: max });
+  if (rejectLogDue(w.count - max)) {
+    logJson(`[CheddaAPI] route limit ${scope}`, { evt: "route_limit_reject", scope, key: cleanForLog(key), cap: max, rejected: w.count - max });
   }
   return error(429, "Too many requests. Please try again later.", { "Retry-After": String(retry) });
 }
@@ -402,8 +457,8 @@ function checkSubmitCeiling(gameId, clientIp, playerId = null) {
     w.count += 1;
     if (w.count > SUBMIT_CAP_PLAYER_PER_HOUR) {
       const retry = Math.max(1, Math.ceil((3600000 - (now - w.start)) / 1000));
-      if (w.count === SUBMIT_CAP_PLAYER_PER_HOUR + 1) {
-        logJson(`[CheddaAPI] POST /scores player-cap game=${cleanForLog(gameId)} player=${fp(playerId)}`, { evt: "submit_cap_reject", scope: "player", game: cleanForLog(gameId), player: fp(playerId), cap: SUBMIT_CAP_PLAYER_PER_HOUR, ...(clientIp ? { ip: clientIp } : {}) });
+      if (rejectLogDue(w.count - SUBMIT_CAP_PLAYER_PER_HOUR)) {
+        logJson(`[CheddaAPI] POST /scores player-cap game=${cleanForLog(gameId)} player=${fp(playerId)}`, { evt: "submit_cap_reject", scope: "player", game: cleanForLog(gameId), player: fp(playerId), cap: SUBMIT_CAP_PLAYER_PER_HOUR, rejected: w.count - SUBMIT_CAP_PLAYER_PER_HOUR, ...(clientIp ? { ip: clientIp } : {}) });
       }
       return error(429, "Too many score submissions for this player. Submit once per game over.", { "Retry-After": String(retry) });
     }
@@ -419,10 +474,10 @@ function checkSubmitCeiling(gameId, clientIp, playerId = null) {
   w.count += 1;
   if (w.count > SUBMIT_CAP_IP_PER_MIN) {
     const retry = Math.max(1, Math.ceil((60000 - (now - w.start)) / 1000));
-    if (w.count === SUBMIT_CAP_IP_PER_MIN + 1) {
-      // Log the first reject of the window only; a runaway client would
-      // otherwise write a log line per request.
-      logJson(`[CheddaAPI] POST /scores ip-cap game=${cleanForLog(gameId || "?")} ip=${clientIp}`, { evt: "submit_cap_reject", scope: "ip", game: cleanForLog(gameId || "?"), ip: clientIp, cap: SUBMIT_CAP_IP_PER_MIN });
+    if (rejectLogDue(w.count - SUBMIT_CAP_IP_PER_MIN)) {
+      // Sampled (see rejectLogDue): a runaway client would otherwise write a
+      // log line per request.
+      logJson(`[CheddaAPI] POST /scores ip-cap game=${cleanForLog(gameId || "?")} ip=${clientIp}`, { evt: "submit_cap_reject", scope: "ip", game: cleanForLog(gameId || "?"), ip: clientIp, cap: SUBMIT_CAP_IP_PER_MIN, rejected: w.count - SUBMIT_CAP_IP_PER_MIN });
     }
     return error(429, "Too many score submissions from this address", { "Retry-After": String(retry) });
   }
@@ -742,7 +797,8 @@ function exactNat(v) {
 // score it just saved looks lost. Hit roughly 2 runs in 3 on a busy game
 // page at ~1 req/s of mixed traffic. The origin now rides in AsyncLocalStorage,
 // which is scoped to the async chain of the request that set it.
-const requestContext = new AsyncLocalStorage();
+// (requestContext itself is declared near the top of the file, before the
+// first log line, since logJson also reads it for the client IP and trace.)
 
 function currentOrigin() {
   return requestContext.getStore()?.origin;
@@ -2322,26 +2378,35 @@ async function handleExternalPlayerRank(actor, gameId, playerId, query, rateLimi
 async function handleCreateScoreboard(actor, sessionId, gameId, body) {
   const { scoreboardId, name, description, period, sortBy, maxEntries, targeted, intervalDays } = body;
   
+  // Every 400 here is logged with its reason. Before 2026-11-04 none were, so
+  // a game re-running a board-setup script (144 "already exists" rejects in
+  // one afternoon) looked like an unexplained failure in the request log.
+  const reject = (msg) => {
+    logJson(`[Scoreboard] create rejected game=${cleanForLog(gameId)} board=${cleanForLog(scoreboardId || "?")} "${cleanForLog(msg)}"`,
+      { evt: "board_create_reject", game: cleanForLog(gameId), board: cleanForLog(scoreboardId || "?"), err: cleanForLog(msg) });
+    return error(400, msg);
+  };
+  
   if (!sessionId) return error(401, "Missing session token");
-  if (!scoreboardId) return error(400, "Missing required field: scoreboardId");
-  if (!name) return error(400, "Missing required field: name");
+  if (!scoreboardId) return reject("Missing required field: scoreboardId");
+  if (!name) return reject("Missing required field: name");
   
   const validPeriods = ["allTime", "daily", "weekly", "monthly", "custom"];
   if (period && !validPeriods.includes(period)) {
-    return error(400, `Invalid period. Must be one of: ${validPeriods.join(", ")}`);
+    return reject(`Invalid period. Must be one of: ${validPeriods.join(", ")}`);
   }
   
   const validSortBy = ["score", "streak"];
   if (sortBy && !validSortBy.includes(sortBy)) {
-    return error(400, `Invalid sortBy. Must be one of: ${validSortBy.join(", ")}`);
+    return reject(`Invalid sortBy. Must be one of: ${validSortBy.join(", ")}`);
   }
   
   if (targeted !== undefined && typeof targeted !== "boolean") {
-    return error(400, "targeted, if provided, must be a boolean");
+    return reject("targeted, if provided, must be a boolean");
   }
   if (intervalDays !== undefined && intervalDays !== null &&
       (typeof intervalDays !== "number" || !Number.isInteger(intervalDays) || intervalDays < 0)) {
-    return error(400, "intervalDays, if provided, must be a non-negative integer");
+    return reject("intervalDays, if provided, must be a non-negative integer");
   }
   
   try {
@@ -2358,8 +2423,11 @@ async function handleCreateScoreboard(actor, sessionId, gameId, body) {
       (intervalDays !== undefined && intervalDays !== null) ? [Math.floor(intervalDays)] : []
     );
     
-    if (result?.ok) return success({ message: result.ok, scoreboardId });
-    if (result?.err) return error(400, result.err);
+    if (result?.ok) {
+      logJson(`[Scoreboard] created game=${cleanForLog(gameId)} board=${cleanForLog(scoreboardId)}`, { evt: "board_created", game: cleanForLog(gameId), board: cleanForLog(scoreboardId) });
+      return success({ message: result.ok, scoreboardId });
+    }
+    if (result?.err) return reject(result.err);
     return error(500, "Unexpected response");
   } catch (e) {
     console.error("[Scoreboard] Create error:", e);
@@ -2957,7 +3025,11 @@ export async function handler(event) {
   // before anything that can await, so every respond()/error() on this
   // request, however deep, sees its own origin and never a neighbour's.
   const origin = event.headers?.origin || event.headers?.Origin;
-  return requestContext.run({ origin }, () => handleRequest(event));
+  // Client IP and trace ride along so every log line on this request carries
+  // them (see logContextFields).
+  const ip = getClientIp(event.headers || {});
+  const trace = traceFromHeaders(event.headers);
+  return requestContext.run({ origin, ip, trace }, () => handleRequest(event));
 }
 
 async function handleRequest(event) {
@@ -3160,7 +3232,10 @@ async function handleRequest(event) {
         const servedLocally = skipFlag && (Date.now() - skipFlag) < SKIP_VALIDATION_TTL;
         if (!servedLocally) {
           const spend = checkRateLimit(apiKey, keyValidation.tier, true);
-          if (!spend.allowed) return error(429, spend.error, { "Retry-After": String(spend.retryAfter) });
+          if (!spend.allowed) {
+            logJson(`[CheddaAPI] tier rate limit game=${cleanForLog(keyValidation.gameId)} path=${method} /${pathParts.join("/")}`, { evt: "submit_cap_reject", scope: "tier", game: cleanForLog(keyValidation.gameId), path: `${method} /${pathParts.join("/")}` });
+            return error(429, spend.error, { "Retry-After": String(spend.retryAfter) });
+          }
         }
         return await handleStartPlaySession(actor, apiKey, keyValidation.gameId, body, keyValidation.rateLimit);
       }
@@ -3196,7 +3271,10 @@ async function handleRequest(event) {
         const endTok = typeof body.playSessionToken === "string" ? body.playSessionToken : "";
         if (endTok && !endTok.startsWith("skip_validation_")) {
           const spend = checkRateLimit(apiKey, keyValidation.tier, true);
-          if (!spend.allowed) return error(429, spend.error, { "Retry-After": String(spend.retryAfter) });
+          if (!spend.allowed) {
+            logJson(`[CheddaAPI] tier rate limit game=${cleanForLog(keyValidation.gameId)} path=${method} /${pathParts.join("/")}`, { evt: "submit_cap_reject", scope: "tier", game: cleanForLog(keyValidation.gameId), path: `${method} /${pathParts.join("/")}` });
+            return error(429, spend.error, { "Retry-After": String(spend.retryAfter) });
+          }
         }
         return await handleEndPlaySessionByApiKey(actor, body, keyValidation.rateLimit);
       }
@@ -3687,7 +3765,7 @@ async function handleRequest(event) {
         status: "healthy",
         version: API_VERSION,
         build: BUILD_STAMP,
-        submitCaps: { ipPerMin: SUBMIT_CAP_IP_PER_MIN, pausedGames: PAUSED_GAMES.size },
+        submitCaps: { ipPerMin: SUBMIT_CAP_IP_PER_MIN, playerPerHour: SUBMIT_CAP_PLAYER_PER_HOUR, pausedGames: PAUSED_GAMES.size },
         // Caller's own forwarding chain, for setting CLIENT_IP_HOPS (see getClientIp).
         clientIp: { chain: xffChain(event.headers || {}).map(cleanForLog), hops: CLIENT_IP_HOPS, resolved: clientIp },
         signingPrincipal,

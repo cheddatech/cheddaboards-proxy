@@ -2,3 +2,10 @@ node_modules/
 .env
 .env.*
 *.pem
+*.key
+*-key.json
+*service-account*.json
+identity.json
+*.log
+cloudrun-logs.json
+.DS_Store
