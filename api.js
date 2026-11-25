@@ -1,5 +1,5 @@
 // =====================================================
-// CheddaBoards HTTP API Proxy v1.11.4
+// CheddaBoards HTTP API Proxy v1.12.0
 // Per-Game OAuth Credentials + Time-Based Scoreboards + Archives
 // + Play Session Time Validation + Batch Achievement Unlocks
 // + End Play Sessions + Account Migration
@@ -11,6 +11,10 @@
 //   safe upgrade requests, real client IP, limits on unauthenticated routes
 // + Reject logging (2026-11-04): ip + trace on every request log line,
 //   counted cap rejects, board-create rejects, play-session tier rejects
+// + Nickname no-op (2026-11-04): an unchanged rename is answered from the
+//   proxy, with no canister write and no tier budget
+// + International display names (2026-11-25, canister v0.18.0): per-game
+//   opt-in, one per account, validated + NFKC-normalised here
 // =====================================================
 
 import { Actor, HttpAgent } from "@dfinity/agent";
@@ -28,12 +32,12 @@ import QRCode from "qrcode";
 const CANISTER_ID = process.env.CANISTER_ID;
 if (!CANISTER_ID) throw new Error("CANISTER_ID environment variable is required");
 const ICP_HOST = process.env.ICP_HOST || "https://icp-api.io";
-const API_VERSION = "1.11.4";
+const API_VERSION = "1.12.0";
 // BUILD_STAMP changes on every edit. Hit /health after deploying: if the stamp
 // you see live doesn't match this, the deploy did NOT take effect (stale bundle
 // / cached function / wrong folder). This makes "did it actually redeploy?" a
 // one-glance check instead of guesswork.
-const BUILD_STAMP = "REJECT-LOGGING-v1-2026-11-04";
+const BUILD_STAMP = "DISPLAY-NAMES-v1-2026-11-25";
 
 // Per-request context (origin, client IP, trace). Declared here, before the
 // first logJson call below, because logJson reads it and a const used before
@@ -331,6 +335,32 @@ const submitPlayerWindows = new Map();   // "game:player" -> { start: ms, count 
 const pendingNicknames = new Map();      // "game:player" -> { nickname, at }
 const PENDING_NICK_TTL_MS = 24 * 3600 * 1000;
 const PENDING_NICK_MAX_ENTRIES = 20000;
+
+// NICKNAME NO-OP (2026-11-04): some web games PUT the player's nickname
+// before every submit, and it is almost always the name they already have
+// (YAJU, ~1 rename per run). Remember the last name applied per
+// (game, player) for a short while and answer a repeat of it here: no
+// canister write and no tier budget. A repeat of either the requested name
+// or the applied one counts (so "Chedz" -> "Chedz_1" then "Chedz" again is a
+// no-op). Kept short so a rename made elsewhere (a submit carrying a
+// nickname, account linking, the session rename) shows up soon; a submit
+// with a nickname also clears the entry straight away.
+const nicknameNoopCache = new Map();     // "game:player" -> { requested, applied, gameProfile, at }
+const NICK_NOOP_TTL_MS = envInt("NICK_NOOP_TTL_MS", 30 * 60 * 1000);
+const NICK_NOOP_MAX_ENTRIES = 20000;
+function nicknameNoopHit(gameId, playerId, nickname) {
+  if (!playerId || typeof nickname !== "string") return null;
+  const key = `${gameId}:${playerId}`;
+  const hit = nicknameNoopCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at >= NICK_NOOP_TTL_MS) { nicknameNoopCache.delete(key); return null; }
+  return (nickname === hit.requested || nickname === hit.applied) ? hit : null;
+}
+function rememberNickname(gameId, playerId, requested, applied, gameProfile) {
+  const now = Date.now();
+  boundedSet(nicknameNoopCache, `${gameId}:${playerId}`, { requested, applied, gameProfile, at: now },
+    NICK_NOOP_MAX_ENTRIES, (e) => (now - e.at) >= NICK_NOOP_TTL_MS);
+}
 const PLAYER_NOT_FOUND_RE = /not found|does not exist|doesn't exist|no such|unknown (player|user)|not registered/i;
 const SUBMIT_IP_MAX_ENTRIES = 10000;
 const SUBMIT_PLAYER_MAX_ENTRIES = 20000;
@@ -646,6 +676,205 @@ function sanitizeNickname(raw, fallback = "Player") {
   let clean = String(raw).trim().replace(/\s+/g, "_").replace(/[^A-Za-z0-9_]/g, "");
   clean = clean.substring(0, 16);
   return clean.length >= 3 ? clean : fallback;
+}
+
+// =====================================================
+// International Display Names (v1.12.0, canister v0.18.0)
+// =====================================================
+// A display name is a second, optional name per ACCOUNT: not unique, any
+// language, only set and shown in games whose owner turned on
+// "International names". The nickname (unique, ASCII, 3-16) is unchanged and
+// stays the name every game can render.
+//
+// The canister only does cheap floor checks (48-byte cap, invisible/bidi/
+// private-use/emoji blocks, one inner space, at least one letter), so the
+// real rules live here:
+//   - NFKC (full-width Latin -> ASCII, ideographic space -> space, composed
+//     kana), trim, collapse whitespace runs
+//   - 2-16 graphemes (Intl.Segmenter), at most 48 UTF-8 bytes
+//   - letters, marks, digits, plus _ - ・ and at most one inner space
+//   - no emoji, no lone leading mark, at most 4 marks per grapheme (zalgo)
+//   - single script, UTS #39 "highly restrictive": one script, or a
+//     Japanese/Chinese/Korean mix (Han + kana / Bopomofo / Hangul), Latin
+//     allowed alongside those
+const DISPLAY_NAME_MIN_GRAPHEMES = 2;
+const DISPLAY_NAME_MAX_GRAPHEMES = 16;
+const DISPLAY_NAME_MAX_BYTES = 48;
+const DISPLAY_NAME_MAX_MARKS_PER_GRAPHEME = 4;
+const graphemeSegmenter = new Intl.Segmenter("und", { granularity: "grapheme" });
+
+// Scripts we name. A letter from any other script counts as its own "Other"
+// script, so it can stand alone but not mix with these.
+const DISPLAY_NAME_SCRIPTS = [
+  "Latin", "Cyrillic", "Greek", "Armenian", "Georgian", "Hebrew", "Arabic",
+  "Thaana", "Syriac", "Devanagari", "Bengali", "Gurmukhi", "Gujarati", "Oriya",
+  "Tamil", "Telugu", "Kannada", "Malayalam", "Sinhala", "Thai", "Lao",
+  "Tibetan", "Myanmar", "Khmer", "Mongolian", "Ethiopic", "Cherokee",
+  "Han", "Hiragana", "Katakana", "Hangul", "Bopomofo",
+].map((name) => [name, new RegExp(`\\p{Script=${name}}`, "u")]);
+
+const CJK_SETS = [
+  new Set(["Latin", "Han", "Hiragana", "Katakana"]),
+  new Set(["Latin", "Han", "Bopomofo"]),
+  new Set(["Latin", "Han", "Hangul"]),
+];
+
+function scriptOf(ch) {
+  for (const [name, re] of DISPLAY_NAME_SCRIPTS) if (re.test(ch)) return name;
+  return "Other";
+}
+
+// Returns { ok: true, value } with the normalised name, or { ok: false, error }.
+// null / "" / whitespace-only means "clear" and returns { ok: true, value: null }.
+function validateDisplayName(raw) {
+  if (raw === null || raw === undefined) return { ok: true, value: null };
+  if (typeof raw !== "string") return { ok: false, error: "displayName must be a string or null" };
+  if (raw.length > 200) return { ok: false, error: "Display name is too long" };
+  const name = raw.normalize("NFKC").trim().replace(/\s+/g, " ");
+  if (name === "") return { ok: true, value: null };
+
+  if (Buffer.byteLength(name, "utf8") > DISPLAY_NAME_MAX_BYTES) {
+    return { ok: false, error: "Display name is too long" };
+  }
+  if (/\p{Extended_Pictographic}|[⃣︀-️]/u.test(name)) {
+    return { ok: false, error: "Display names can't contain emoji" };
+  }
+  if (!/^[\p{L}\p{M}\p{N}_\-・ ]+$/u.test(name)) {
+    return { ok: false, error: "Display names can use letters, numbers, _ - ・ and one space" };
+  }
+  if ((name.match(/ /g) || []).length > 1) {
+    return { ok: false, error: "Display names can have at most one space" };
+  }
+  if (!/\p{L}/u.test(name)) {
+    return { ok: false, error: "Display name needs at least one letter" };
+  }
+  if (/^\p{M}/u.test(name)) {
+    return { ok: false, error: "Display name can't start with a combining mark" };
+  }
+
+  const graphemes = [...graphemeSegmenter.segment(name)].map((s) => s.segment);
+  if (graphemes.length < DISPLAY_NAME_MIN_GRAPHEMES || graphemes.length > DISPLAY_NAME_MAX_GRAPHEMES) {
+    return { ok: false, error: `Display name must be ${DISPLAY_NAME_MIN_GRAPHEMES}-${DISPLAY_NAME_MAX_GRAPHEMES} characters` };
+  }
+  for (const g of graphemes) {
+    if ((g.match(/\p{M}/gu) || []).length > DISPLAY_NAME_MAX_MARKS_PER_GRAPHEME) {
+      return { ok: false, error: "Display name has too many accents on one character" };
+    }
+  }
+
+  const scripts = new Set();
+  for (const ch of name) {
+    if (/\p{L}/u.test(ch)) scripts.add(scriptOf(ch));
+  }
+  if (scripts.size > 1 && !CJK_SETS.some((set) => [...scripts].every((s) => set.has(s)))) {
+    return { ok: false, error: "Display names can't mix alphabets (Japanese, Chinese and Korean mixes are fine)" };
+  }
+  return { ok: true, value: name };
+}
+
+// Per-game "International names" flag, cached. Off is the default and the
+// common case, so a miss costs one query per game per minute at most.
+const intlNamesCache = new Map(); // gameId -> { on, at }
+const INTL_NAMES_TTL_MS = 60 * 1000;
+async function intlNamesOn(actor, gameId) {
+  if (!gameId) return false;
+  const hit = intlNamesCache.get(gameId);
+  if (hit && (Date.now() - hit.at) < INTL_NAMES_TTL_MS) return hit.on;
+  try {
+    const on = !!(await actor.getGameIntlNames(gameId));
+    boundedSet(intlNamesCache, gameId, { on, at: Date.now() }, 5000, (e) => (Date.now() - e.at) >= INTL_NAMES_TTL_MS);
+    return on;
+  } catch (e) {
+    // Old IDL / canister: treat as off. Nothing is shown that shouldn't be.
+    return false;
+  }
+}
+
+// Optional display name from a Candid opt (board rows, profile). Spread into
+// the response object so games with the flag off get byte-identical JSON.
+function dnField(opt) {
+  return Array.isArray(opt) && opt.length && typeof opt[0] === "string" ? { displayName: opt[0] } : {};
+}
+
+// Pending display names: same reason as pendingNicknames. An external player
+// only exists once a score creates them, so a name chosen on the first screen
+// is held here and applied right after that player's first successful submit.
+const pendingDisplayNames = new Map(); // "game:player" -> { displayName, at }
+const PENDING_DN_TTL_MS = 24 * 3600 * 1000;
+const PENDING_DN_MAX_ENTRIES = 20000;
+const LIMIT_DISPLAY_NAME_PER_PLAYER_HOUR = envInt("LIMIT_DISPLAY_NAME_PER_PLAYER_HOUR", 20);
+
+function applyPendingDisplayName(actor, gameId, playerId) {
+  const key = `${gameId}:${playerId}`;
+  const pend = pendingDisplayNames.get(key);
+  if (!pend) return;
+  pendingDisplayNames.delete(key);
+  if (Date.now() - pend.at >= PENDING_DN_TTL_MS) return;
+  // Fire and forget: the submit has already succeeded and must not wait on this.
+  actor.setDisplayName("external", playerId, gameId, [pend.displayName]).then((r) => {
+    if (r?.ok) logJson(`[CheddaAPI] pending display name applied game=${cleanForLog(gameId)} player=${fp(playerId)}`, { evt: "display_name_pending_applied", game: cleanForLog(gameId), player: fp(playerId) });
+    else logJson(`[CheddaAPI] pending display name refused game=${cleanForLog(gameId)} player=${fp(playerId)} err="${cleanForLog(r?.err)}"`, { evt: "display_name_reject", game: cleanForLog(gameId), player: fp(playerId), err: cleanForLog(r?.err) });
+  }).catch((e) => logError("[CheddaAPI] pending display name error", e, { evt: "display_name_err", game: cleanForLog(gameId) }));
+}
+
+// Shared by the API-key and session routes. userIdType is "external" or "session".
+async function handleSetDisplayName(actor, userIdType, userId, gameId, body, extraHeaders = {}) {
+  if (!gameId) return error(400, "Missing game ID");
+  if (!body || !("displayName" in body)) return error(400, "Missing field: displayName (send null to clear)");
+  const v = validateDisplayName(body.displayName);
+  if (!v.ok) {
+    logJson(`[CheddaAPI] display name invalid game=${cleanForLog(gameId)} "${cleanForLog(v.error)}"`, { evt: "display_name_reject", game: cleanForLog(gameId), err: cleanForLog(v.error), stage: "proxy" });
+    return error(400, v.error);
+  }
+  const who = userIdType === "external" ? userId : `sess_${fp(userId)}`;
+  const limited = routeLimit("dname", `${gameId}:${fp(who)}`, LIMIT_DISPLAY_NAME_PER_PLAYER_HOUR, 3600000);
+  if (limited) return limited;
+  if (!(await intlNamesOn(actor, gameId))) {
+    return error(400, "International names are not enabled for this game. The developer can turn them on in the dashboard.");
+  }
+
+  try {
+    const result = await actor.setDisplayName(userIdType, userId, gameId, v.value === null ? [] : [v.value]);
+    if (result?.ok) {
+      if (userIdType === "external") pendingDisplayNames.delete(`${gameId}:${userId}`);
+      const dn = result.ok.displayName.length ? result.ok.displayName[0] : null;
+      logJson(`[CheddaAPI] display name ${dn === null ? "cleared" : "set"} game=${cleanForLog(gameId)}`, { evt: "display_name_set", game: cleanForLog(gameId), auth: userIdType, cleared: dn === null });
+      return success({ displayName: dn, nickname: result.ok.nickname }, extraHeaders);
+    }
+    const errStr = String(result?.err || "Unexpected response");
+    if (userIdType === "external" && /User not found/i.test(errStr)) {
+      // No score yet: hold the name for their first submit.
+      const nowPend = Date.now();
+      if (v.value === null) {
+        pendingDisplayNames.delete(`${gameId}:${userId}`);
+      } else {
+        boundedSet(pendingDisplayNames, `${gameId}:${userId}`, { displayName: v.value, at: nowPend }, PENDING_DN_MAX_ENTRIES,
+          (p) => (nowPend - p.at) >= PENDING_DN_TTL_MS);
+      }
+      logJson(`[CheddaAPI] display name queued until first score game=${cleanForLog(gameId)} player=${fp(userId)}`, { evt: "display_name_pending", game: cleanForLog(gameId), player: fp(userId) });
+      return success({ displayName: v.value, nickname: null, pending: true,
+        message: "Display name saved. It will appear on the leaderboard with your first score." }, extraHeaders);
+    }
+    if (/not enabled/i.test(errStr)) intlNamesCache.delete(gameId);
+    logJson(`[CheddaAPI] display name reject game=${cleanForLog(gameId)} err="${cleanForLog(errStr)}"`, { evt: "display_name_reject", game: cleanForLog(gameId), err: cleanForLog(errStr), stage: "canister" });
+    return error(userIdType === "session" ? sessionErrorStatus(errStr) : 400, errStr);
+  } catch (e) {
+    logError("[CheddaAPI] display name error", e, { evt: "display_name_err", game: cleanForLog(gameId) });
+    return error(500, "Failed to set display name");
+  }
+}
+
+// The player's own display name for a profile response, or {} when the game
+// hasn't opted in (no extra canister call in that case).
+async function displayNameForProfile(actor, userIdType, userId, gameId) {
+  if (!(await intlNamesOn(actor, gameId))) return {};
+  try {
+    const r = await actor.getDisplayName(userIdType, userId, gameId);
+    if (r?.ok) return { displayName: r.ok.length ? r.ok[0] : null };
+  } catch (e) {
+    // Profile still works without it.
+  }
+  return {};
 }
 
 function generateUserCode() {
@@ -1245,8 +1474,10 @@ async function handleGetProfile(actor, sessionId, gameId) {
         }
       }
       
+      const dnExtra = gameId ? await displayNameForProfile(actor, "session", sessionId, gameId) : {};
       return success({
         nickname: profile.nickname,
+        ...dnExtra,
         authType: profile.authType,
         created: exactNat(profile.created),
         lastUpdated: exactNat(profile.last_updated),
@@ -1314,6 +1545,21 @@ async function handleStartPlaySession(actor, apiKey, gameId, body, rateLimit) {
     }
     
     if (result?.err) {
+      // SKIP-ERR (2026-11-11): for some validation-off games the canister
+      // answers "Time validation not enabled for this game" instead of a
+      // skip_validation_ token, so the shortcut cache never filled and every
+      // start 400'd (everything-wants-you-dead, ~100/day from 8 Nov). Starting
+      // a session on a validation-off game should be harmless: treat the
+      // error as "validation off", cache it, and mint the placeholder here.
+      if (/time validation not enabled/i.test(String(result.err))) {
+        skipValidationGames.set(gameId, Date.now());
+        const localToken = `skip_validation_${gameId}_${Date.now()}`;
+        logJson(`[PlaySession] Session started (local, canister reports validation off): ${localToken.substring(0, 12)}...`, { evt: "session_started", auth: "api-key", game: cleanForLog(gameId), mode: "skip_validation", via: "canister_err" });
+        return success({
+          ok: localToken,
+          message: "Play session started"
+        }, { "X-RateLimit-Remaining": String(rateLimit?.hour || 0) });
+      }
       logJson(`[PlaySession] Error: ${cleanForLog(result.err)}`, { evt: "session_start", auth: "api-key", game: cleanForLog(gameId), result: "err", err: cleanForLog(result.err) });
       return error(400, result.err);
     }
@@ -1345,6 +1591,13 @@ async function handleStartPlaySessionBySession(actor, sessionId, gameId) {
     }
     
     if (result?.err) {
+      // SKIP-ERR (2026-11-11): same as the API-key start. Validation is off,
+      // so hand back a placeholder instead of failing a linked player's run.
+      if (/time validation not enabled/i.test(String(result.err))) {
+        const localToken = `skip_validation_${gameId}_${Date.now()}`;
+        logJson(`[PlaySession] Session started (local, canister reports validation off): ${localToken.substring(0, 12)}...`, { evt: "session_started", auth: "oauth", game: cleanForLog(gameId), mode: "skip_validation", via: "canister_err" });
+        return success({ ok: localToken, message: "Play session started" });
+      }
       logJson(`[PlaySession] Error: ${cleanForLog(result.err)}`, { evt: "session_start", auth: "oauth", game: cleanForLog(gameId), result: "err", err: cleanForLog(result.err) });
       return error(400, result.err);
     }
@@ -2185,6 +2438,7 @@ async function handleGetScoreboard(actor, gameId, scoreboardId, limit) {
         entries: entries.map(e => ({
           rank: Number(e.rank),
           nickname: e.nickname,
+          ...dnField(e.displayName),
           score: Number(e.score),
           streak: Number(e.streak),
           authType: e.authType,
@@ -2525,6 +2779,7 @@ async function handleGetLastArchive(actor, gameId, scoreboardId, limit) {
       entries: archive.entries.map(e => ({
         rank: Number(e.rank),
         nickname: e.nickname,
+        ...dnField(e.displayName),
         score: Number(e.score),
         streak: Number(e.streak),
         authType: e.authType,
@@ -2560,6 +2815,7 @@ async function handleGetArchive(actor, archiveId, limit) {
       entries: archive.entries.map(e => ({
         rank: Number(e.rank),
         nickname: e.nickname,
+        ...dnField(e.displayName),
         score: Number(e.score),
         streak: Number(e.streak),
         authType: e.authType,
@@ -2669,7 +2925,8 @@ function checkRateLimit(apiKey, tier, consume = true) {
 // canister update. Everything else (reads, play sessions, health) is free.
 function isTierCountedRequest(method, pathParts) {
   if (method === "POST" && (pathParts[0] === "scores" || pathParts[0] === "achievements")) return true;
-  if (method === "PUT" && pathParts[0] === "players" && pathParts[2] === "nickname") return true;
+  // PUT /players/:id/nickname is charged in its route instead, after the
+  // no-op check, so an unchanged rename doesn't spend the budget.
   return false;
 }
 
@@ -2692,8 +2949,30 @@ async function validateApiKeyAsync(apiKey, actor, gameIdHeader = null, countsAga
     return { valid: false, error: "Invalid API key" };
   } catch (e) {
     logError("[CheddaAPI] Key validation error", e, { evt: "key_validation_err" });
-    return { valid: false, error: "Failed to validate API key" };
+    return { valid: false, error: "Failed to validate API key", transient: true };
   }
+}
+
+// KEY-REJECT LOGGING (2026-11-11): a failed key check used to return 401 with
+// no log line, so ~1,100 yajuzou nickname 401s (5-6 Nov) were invisible in
+// stdout. Every non-429 key failure is now logged as evt=key_reject with the
+// path and reason. A canister error during validation (transient) is our
+// fault, not the client's, so it returns 503 + Retry-After instead of 401.
+// Tier-limit 429s keep their own submit_cap_reject logging at the call sites.
+function keyRejectResponse(keyValidation, method, pathParts, gameIdHeader, clientIp) {
+  if (keyValidation.retryAfter) {
+    return error(429, keyValidation.error, { "Retry-After": String(keyValidation.retryAfter) });
+  }
+  const code = keyValidation.transient ? 503 : 401;
+  logJson(`[CheddaAPI] key reject ${code} game=${cleanForLog(gameIdHeader || "?")} path=${method} /${pathParts.join("/")} err="${cleanForLog(keyValidation.error)}"`, {
+    evt: "key_reject",
+    status: code,
+    game: cleanForLog(gameIdHeader || "?"),
+    path: cleanForLog(`${method} /${pathParts.join("/")}`),
+    err: cleanForLog(keyValidation.error),
+    ...(clientIp ? { ip: clientIp } : {}),
+  });
+  return error(code, keyValidation.error, code === 503 ? { "Retry-After": "5" } : {});
 }
 
 async function handleExternalSubmitScore(actor, apiKey, gameId, body, rateLimit) {
@@ -2707,6 +2986,7 @@ async function handleExternalSubmitScore(actor, apiKey, gameId, body, rateLimit)
 
   // Apply a nickname the player chose before their first score (see pendingNicknames).
   const pendKey = `${gameId}:${playerId}`;
+  if (body.nickname) nicknameNoopCache.delete(pendKey); // may rename: drop the no-op entry
   const pend = pendingNicknames.get(pendKey);
   let usedPending = false;
   if (pend) {
@@ -2739,6 +3019,7 @@ async function handleExternalSubmitScore(actor, apiKey, gameId, body, rateLimit)
       if (result?.ok) {
         if (pend) pendingNicknames.delete(pendKey);
         if (usedPending) logJson(`[CheddaAPI] pending nickname applied game=${cleanForLog(gameId)} player=${fp(playerId)}`, { evt: "nickname_pending_applied", game: cleanForLog(gameId) });
+        applyPendingDisplayName(actor, gameId, playerId);
         logJson(`[CheddaAPI] POST /scores (api-key) game=${cleanForLog(gameId)} board=${cleanForLog(scoreboardId)} player=${fp(playerId)} result=ok`, { evt: "submit", auth: "api-key", game: cleanForLog(gameId), board: cleanForLog(scoreboardId), player: fp(playerId), result: "ok" });
         return success({ message: result.ok, scoreboardId }, { "X-RateLimit-Remaining": String(rateLimit?.hour || 0) });
       }
@@ -2770,6 +3051,7 @@ async function handleExternalSubmitScore(actor, apiKey, gameId, body, rateLimit)
     if (result?.ok) {
       if (pend) pendingNicknames.delete(pendKey);
       if (usedPending) logJson(`[CheddaAPI] pending nickname applied game=${cleanForLog(gameId)} player=${fp(playerId)}`, { evt: "nickname_pending_applied", game: cleanForLog(gameId) });
+      applyPendingDisplayName(actor, gameId, playerId);
       logJson(`[CheddaAPI] POST /scores (api-key) game=${cleanForLog(gameId)} board=main player=${fp(playerId)} result=ok`, { evt: "submit", auth: "api-key", game: cleanForLog(gameId), board: "main", player: fp(playerId), result: "ok" });
       return success(fanOut ? { message: result.ok, scoreboardId, fanOut: true } : { message: result.ok }, { "X-RateLimit-Remaining": String(rateLimit?.hour || 0) });
     }
@@ -2808,15 +3090,18 @@ async function handleExternalChangeNickname(actor, gameId, playerId, body, rateL
     
     if (result?.ok) {
       pendingNicknames.delete(`${gameId}:${playerId}`);
+      const gameProfile = result.ok.gameProfile ? {
+        score: Number(result.ok.gameProfile.total_score),
+        streak: Number(result.ok.gameProfile.best_streak),
+      } : null;
+      rememberNickname(gameId, playerId, nickname, result.ok.nickname, gameProfile);
       return success({
         message: result.ok.message,
         nickname: result.ok.nickname,
-        gameProfile: result.ok.gameProfile ? {
-          score: Number(result.ok.gameProfile.total_score),
-          streak: Number(result.ok.gameProfile.best_streak),
-        } : null
+        gameProfile,
       }, { "X-RateLimit-Remaining": String(rateLimit?.hour || 0) });
     }
+    nicknameNoopCache.delete(`${gameId}:${playerId}`);
     if (result?.err) {
       const errStr = String(result.err);
       if (PLAYER_NOT_FOUND_RE.test(errStr)) {
@@ -2895,6 +3180,7 @@ async function handleGetGameInfo(actor, gameId) {
         totalPlays: Number(g.totalPlays),
         isActive: g.isActive,
         timeValidationEnabled: g.timeValidationEnabled || false,
+        internationalNames: await intlNamesOn(actor, gameId),
         nativeAuth: {
           googleEnabled: oauthConfig?.googleClientIds?.length > 0 || FALLBACK_GOOGLE_CLIENT_IDS.length > 0,
           appleEnabled: !!oauthConfig?.appleBundleId || !!FALLBACK_APPLE_BUNDLE_ID,
@@ -2951,6 +3237,7 @@ async function handleAdminScoreboard(actor, sessionId, gameId, scoreboardId) {
         entries: result.ok.map((e) => ({
           playerKey: e.playerKey,
           nickname: e.nickname,
+          ...dnField(e.displayName),
           score: Number(e.score),
           streak: Number(e.streak),
           submittedAt: exactNat(e.submittedAt),
@@ -3222,8 +3509,7 @@ async function handleRequest(event) {
       if (apiKey) {
         const keyValidation = await validateApiKeyAsync(apiKey, actor, gameIdHeader, false);  // sessions don't spend the tier budget
         if (!keyValidation.valid) {
-          const code = keyValidation.retryAfter ? 429 : 401;
-          return error(code, keyValidation.error, keyValidation.retryAfter ? { "Retry-After": String(keyValidation.retryAfter) } : {});
+          return keyRejectResponse(keyValidation, method, pathParts, gameIdHeader, clientIp);
         }
         // SECURITY-AUDIT 2026-10-25: a start that goes to the canister is an
         // update call, so it spends the tier budget. Starts served locally
@@ -3264,8 +3550,7 @@ async function handleRequest(event) {
       if (apiKey) {
         const keyValidation = await validateApiKeyAsync(apiKey, actor, gameIdHeader, false);  // sessions don't spend the tier budget
         if (!keyValidation.valid) {
-          const code = keyValidation.retryAfter ? 429 : 401;
-          return error(code, keyValidation.error, keyValidation.retryAfter ? { "Retry-After": String(keyValidation.retryAfter) } : {});
+          return keyRejectResponse(keyValidation, method, pathParts, gameIdHeader, clientIp);
         }
         // Same rule as start: only a real canister cancel spends budget.
         const endTok = typeof body.playSessionToken === "string" ? body.playSessionToken : "";
@@ -3379,6 +3664,36 @@ async function handleRequest(event) {
       return await handleRemoveScoreEntry(actor, sessionToken, pathParts[1], pathParts[3], pathParts[5], purge);
     }
 
+    // PUT /games/:gameId/international-names {enabled} - dashboard toggle (owner session)
+    if (method === "PUT" && pathParts[0] === "games" && pathParts[2] === "international-names" && !pathParts[3]) {
+      if (!sessionToken) return error(401, "Missing session token");
+      if (typeof body.enabled !== "boolean") return error(400, "enabled must be true or false");
+      try {
+        const result = await actor.setGameIntlNamesBySession(sessionToken, pathParts[1], body.enabled);
+        intlNamesCache.delete(pathParts[1]);
+        if (result?.ok !== undefined) return success({ message: result.ok, internationalNames: body.enabled });
+        if (result?.err) return moderationError(result.err);
+        return error(500, "Unexpected response");
+      } catch (e) {
+        logError("[CheddaAPI] intl names toggle error", e, { evt: "intl_names_err", game: cleanForLog(pathParts[1]) });
+        return error(500, "Failed to update international names");
+      }
+    }
+
+    // DELETE /games/:gameId/players/:playerKey/display-name - owner clears a player's display name
+    if (method === "DELETE" && pathParts[0] === "games" && pathParts[2] === "players" && pathParts[3] && pathParts[4] === "display-name") {
+      if (!sessionToken) return error(401, "Missing session token");
+      try {
+        const result = await actor.resetPlayerDisplayNameBySession(sessionToken, pathParts[1], pathParts[3]);
+        if (result?.ok !== undefined) return success({ message: result.ok });
+        if (result?.err) return moderationError(result.err);
+        return error(500, "Unexpected response");
+      } catch (e) {
+        logError("[CheddaAPI] display name reset error", e, { evt: "display_name_err", game: cleanForLog(pathParts[1]) });
+        return error(500, "Failed to reset display name");
+      }
+    }
+
     if (method === "DELETE" && pathParts[0] === "games" && pathParts[2] === "players" && pathParts[3] && pathParts[4] === "scores") {
       const purge = query.archives === "true";
       return await handleRemovePlayerScores(actor, sessionToken, pathParts[1], pathParts[3], purge);
@@ -3423,6 +3738,11 @@ async function handleRequest(event) {
         return await handleSessionChangeNickname(actor, sessionToken, gameId, body);
       }
       
+      // PUT /profile/display-name {displayName} - international display name (null clears)
+      if (method === "PUT" && pathParts[0] === "profile" && pathParts[1] === "display-name") {
+        return await handleSetDisplayName(actor, "session", sessionToken, gameId, body);
+      }
+      
       // GET /players/:playerId/rank - same SDK call from a linked (session)
       // player: the session identifies them, so the path's player ID is ignored.
       if (method === "GET" && pathParts[0] === "players" && pathParts[2] === "rank") {
@@ -3451,13 +3771,12 @@ async function handleRequest(event) {
       const countsAgainstLimit = isTierCountedRequest(method, pathParts);
       const keyValidation = await validateApiKeyAsync(apiKey, actor, gameIdHeader, countsAgainstLimit);
       if (!keyValidation.valid) {
-        const code = keyValidation.retryAfter ? 429 : 401;
-        if (code === 429) {
+        if (keyValidation.retryAfter) {
           // Tier limit hit (checkRateLimit). Logged so the daily summaries can
           // see who is pressing on the per-key ceiling.
           logJson(`[CheddaAPI] tier rate limit game=${cleanForLog(gameIdHeader || "?")} path=${method} /${pathParts.join("/")}`, { evt: "submit_cap_reject", scope: "tier", game: cleanForLog(gameIdHeader || "?"), path: `${method} /${pathParts.join("/")}`, ...(clientIp ? { ip: clientIp } : {}) });
         }
-        return error(code, keyValidation.error, keyValidation.retryAfter ? { "Retry-After": String(keyValidation.retryAfter) } : {});
+        return keyRejectResponse(keyValidation, method, pathParts, gameIdHeader, clientIp);
       }
       
       const gameId = keyValidation.gameId;
@@ -3501,7 +3820,36 @@ async function handleRequest(event) {
       
       if (method === "PUT" && pathParts[0] === "players" && pathParts[2] === "nickname") {
         const playerId = pathParts[1];
-        return await handleExternalChangeNickname(actor, gameId, playerId, body, rateLimit);
+        const same = nicknameNoopHit(gameId, playerId, body?.nickname);
+        if (same) {
+          logJson(`[CheddaAPI] nickname unchanged game=${cleanForLog(gameId)} player=${fp(playerId)}`,
+            { evt: "nickname_noop", game: cleanForLog(gameId), player: fp(playerId) });
+          return success({
+            message: "Nickname unchanged: " + same.applied,
+            nickname: same.applied,
+            gameProfile: same.gameProfile,
+            unchanged: true,
+          }, { "X-RateLimit-Remaining": String(rateLimit?.hour || 0) });
+        }
+        // A real rename: spend the per-key budget now (skipped above).
+        const charge = checkRateLimit(apiKey, keyValidation.tier, true);
+        if (!charge.allowed) {
+          logJson(`[CheddaAPI] tier rate limit game=${cleanForLog(gameId)} path=${method} /${pathParts.join("/")}`, { evt: "submit_cap_reject", scope: "tier", game: cleanForLog(gameId), path: `${method} /${pathParts.join("/")}`, ...(clientIp ? { ip: clientIp } : {}) });
+          return error(429, charge.error, charge.retryAfter ? { "Retry-After": String(charge.retryAfter) } : {});
+        }
+        return await handleExternalChangeNickname(actor, gameId, playerId, body, charge.remaining);
+      }
+      
+      // PUT /players/:playerId/display-name {displayName} - international display name (null clears)
+      if (method === "PUT" && pathParts[0] === "players" && pathParts[1] && pathParts[2] === "display-name") {
+        const playerId = pathParts[1];
+        if (playerId.length > 100) return error(400, "playerId must be at most 100 characters");
+        const charge = checkRateLimit(apiKey, keyValidation.tier, true);
+        if (!charge.allowed) {
+          logJson(`[CheddaAPI] tier rate limit game=${cleanForLog(gameId)} path=${method} /${pathParts.join("/")}`, { evt: "submit_cap_reject", scope: "tier", game: cleanForLog(gameId), path: `${method} /${pathParts.join("/")}`, ...(clientIp ? { ip: clientIp } : {}) });
+          return error(429, charge.error, charge.retryAfter ? { "Retry-After": String(charge.retryAfter) } : {});
+        }
+        return await handleSetDisplayName(actor, "external", playerId, gameId, body, { "X-RateLimit-Remaining": String(charge.remaining?.hour || 0) });
       }
       
       // GET /players/:playerId/rank - rank for an anonymous/external player
@@ -3528,8 +3876,10 @@ async function handleRequest(event) {
                 break;
               }
             }
+            const dnExtra = await displayNameForProfile(actor, "external", playerId, gameId);
             return success({
               nickname: profile.nickname,
+              ...dnExtra,
               created: exactNat(profile.created),
               gameProfile: gameProfile,
             }, { "X-RateLimit-Remaining": String(rateLimit?.hour || 0) });
@@ -3964,6 +4314,7 @@ async function handleRequest(event) {
             "POST /scores": "Submit score (include playSessionToken for time validation)",
             "POST /achievements": "Unlock achievement",
             "PUT /profile/nickname": "Change nickname",
+            "PUT /profile/display-name": "Set display name in any language {displayName} (null clears; game must enable International names)",
             "GET /leaderboard": "Get legacy leaderboard",
             "POST /migrate-account": "Upgrade anonymous account to verified {deviceId}"
           },
@@ -3973,6 +4324,7 @@ async function handleRequest(event) {
             "POST /scores": "Submit score (external)",
             "POST /achievements": "Unlock achievement {playerId, achievementId}",
             "PUT /players/:id/nickname": "Change nickname",
+            "PUT /players/:id/display-name": "Set display name in any language {displayName} (null clears; game must enable International names)",
             "GET /players/:id/profile": "Get player profile",
             "GET /scoreboards/:id/archives": "List archives",
             "GET /scoreboards/:id/archives/latest": "Get last archive"

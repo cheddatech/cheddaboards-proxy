@@ -1,6 +1,6 @@
 export const idlFactory = ({ IDL }) => {
   const Result_1 = IDL.Variant({ 'ok' : IDL.Text, 'err' : IDL.Text });
-  const Result_20 = IDL.Variant({
+  const Result_22 = IDL.Variant({
     'ok' : IDL.Record({
       'nickname' : IDL.Text,
       'message' : IDL.Text,
@@ -16,7 +16,7 @@ export const idlFactory = ({ IDL }) => {
     }),
     'err' : IDL.Text,
   });
-  const Result_19 = IDL.Variant({ 'ok' : IDL.Nat, 'err' : IDL.Text });
+  const Result_21 = IDL.Variant({ 'ok' : IDL.Nat, 'err' : IDL.Text });
   const AuthType = IDL.Variant({
     'internetIdentity' : IDL.Null,
     'apple' : IDL.Null,
@@ -32,7 +32,7 @@ export const idlFactory = ({ IDL }) => {
     'sessionId' : IDL.Text,
     'lastUsed' : IDL.Nat64,
   });
-  const Result_18 = IDL.Variant({ 'ok' : Session, 'err' : IDL.Text });
+  const Result_20 = IDL.Variant({ 'ok' : Session, 'err' : IDL.Text });
   const AccessMode = IDL.Variant({
     'apiOnly' : IDL.Null,
     'both' : IDL.Null,
@@ -65,11 +65,12 @@ export const idlFactory = ({ IDL }) => {
     'streak' : IDL.Nat64,
     'nickname' : IDL.Text,
     'authType' : IDL.Text,
+    'displayName' : IDL.Opt(IDL.Text),
     'rank' : IDL.Nat,
     'submittedAt' : IDL.Nat64,
     'score' : IDL.Nat64,
   });
-  const Result_17 = IDL.Variant({
+  const Result_19 = IDL.Variant({
     'ok' : IDL.Record({
       'entries' : IDL.Vec(PublicScoreEntry),
       'config' : IDL.Record({
@@ -91,6 +92,16 @@ export const idlFactory = ({ IDL }) => {
     'archiveId' : IDL.Text,
     'topPlayer' : IDL.Opt(IDL.Text),
   });
+  const Result_18 = IDL.Variant({
+    'ok' : IDL.Record({
+      'tier' : IDL.Text,
+      'maxFanoutBoards' : IDL.Nat,
+      'boards' : IDL.Nat,
+      'maxBoards' : IDL.Nat,
+      'fanoutBoards' : IDL.Nat,
+    }),
+    'err' : IDL.Text,
+  });
   const DailyStats = IDL.Record({
     'uniquePlayers' : IDL.Nat,
     'date' : IDL.Text,
@@ -108,6 +119,7 @@ export const idlFactory = ({ IDL }) => {
     'deletedBy' : IDL.Principal,
     'reason' : IDL.Text,
   });
+  const Result_13 = IDL.Variant({ 'ok' : IDL.Opt(IDL.Text), 'err' : IDL.Text });
   const EntryDeletionRecord = IDL.Record({
     'playerKey' : IDL.Text,
     'archiveRemoved' : IDL.Nat,
@@ -119,11 +131,11 @@ export const idlFactory = ({ IDL }) => {
     'caller' : IDL.Principal,
     'liveRemoved' : IDL.Nat,
   });
-  const Result_16 = IDL.Variant({
+  const Result_17 = IDL.Variant({
     'ok' : IDL.Vec(EntryDeletionRecord),
     'err' : IDL.Text,
   });
-  const Result_15 = IDL.Variant({
+  const Result_16 = IDL.Variant({
     'ok' : IDL.Record({
       'appleConfigured' : IDL.Bool,
       'googleConfigured' : IDL.Bool,
@@ -141,8 +153,8 @@ export const idlFactory = ({ IDL }) => {
     'last_played' : IDL.Nat64,
     'play_count' : IDL.Nat,
   });
-  const Result_14 = IDL.Variant({ 'ok' : GameProfile, 'err' : IDL.Text });
-  const Result_13 = IDL.Variant({
+  const Result_15 = IDL.Variant({ 'ok' : GameProfile, 'err' : IDL.Text });
+  const Result_14 = IDL.Variant({
     'ok' : IDL.Record({
       'entries' : IDL.Vec(PublicScoreEntry),
       'config' : IDL.Record({
@@ -206,6 +218,7 @@ export const idlFactory = ({ IDL }) => {
         'streak' : IDL.Nat64,
         'nickname' : IDL.Text,
         'authType' : IDL.Text,
+        'displayName' : IDL.Opt(IDL.Text),
         'rank' : IDL.Nat,
         'submittedAt' : IDL.Nat64,
         'score' : IDL.Nat64,
@@ -280,6 +293,13 @@ export const idlFactory = ({ IDL }) => {
   });
   const Result_4 = IDL.Variant({
     'ok' : IDL.Record({
+      'nickname' : IDL.Text,
+      'displayName' : IDL.Opt(IDL.Text),
+    }),
+    'err' : IDL.Text,
+  });
+  const Result_3 = IDL.Variant({
+    'ok' : IDL.Record({
       'isNewUser' : IDL.Bool,
       'nickname' : IDL.Text,
       'message' : IDL.Text,
@@ -294,10 +314,6 @@ export const idlFactory = ({ IDL }) => {
         })
       ),
     }),
-    'err' : IDL.Text,
-  });
-  const Result_3 = IDL.Variant({
-    'ok' : IDL.Record({ 'rank' : IDL.Nat, 'isNewBest' : IDL.Bool }),
     'err' : IDL.Text,
   });
   const Result_2 = IDL.Variant({
@@ -327,16 +343,23 @@ export const idlFactory = ({ IDL }) => {
     'err' : IDL.Text,
   });
   return IDL.Service({
+    'adminBackfillBoardStats' : IDL.Func([IDL.Opt(IDL.Text)], [Result_1], []),
     'adminCleanupSessions' : IDL.Func([], [IDL.Text], []),
     'adminGate' : IDL.Func([IDL.Text, IDL.Vec(IDL.Text)], [Result_1], []),
+    'adminRecreateDefaultBoards' : IDL.Func([IDL.Text], [Result_1], []),
+    'adminRestoreAllTimeFromProfiles' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Bool],
+        [Result_1],
+        [],
+      ),
     'canDeleteGame' : IDL.Func([], [IDL.Bool], ['query']),
     'cancelPlaySession' : IDL.Func([IDL.Text], [Result_1], []),
     'changeNicknameAndGetProfile' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Text, IDL.Text],
-        [Result_20],
+        [Result_22],
         [],
       ),
-    'cleanupAllExpiredPlaySessions' : IDL.Func([], [Result_19], []),
+    'cleanupAllExpiredPlaySessions' : IDL.Func([], [Result_21], []),
     'cleanupExpiredGames' : IDL.Func([], [Result_1], []),
     'clearGameOAuthCredentials' : IDL.Func(
         [IDL.Text, IDL.Text],
@@ -381,7 +404,7 @@ export const idlFactory = ({ IDL }) => {
       ),
     'createSessionForVerifiedUser' : IDL.Func(
         [AuthType, IDL.Text, IDL.Opt(IDL.Text), IDL.Text],
-        [Result_18],
+        [Result_20],
         [],
       ),
     'debugDataState' : IDL.Func(
@@ -399,7 +422,6 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
-    'deleteFile' : IDL.Func([IDL.Text], [Result_1], []),
     'deleteGame' : IDL.Func([IDL.Text], [Result_1], []),
     'deleteGameBySession' : IDL.Func([IDL.Text, IDL.Text], [Result_1], []),
     'deleteScoreboard' : IDL.Func([IDL.Text, IDL.Text], [Result_1], []),
@@ -450,12 +472,22 @@ export const idlFactory = ({ IDL }) => {
       ),
     'getArchivedScoreboard' : IDL.Func(
         [IDL.Text, IDL.Nat],
-        [Result_17],
+        [Result_19],
         ['query'],
       ),
     'getArchivesInRange' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat64, IDL.Nat64],
         [IDL.Vec(ArchiveInfo)],
+        ['query'],
+      ),
+    'getBoardCapExemptions' : IDL.Func(
+        [IDL.Text],
+        [IDL.Vec(IDL.Text)],
+        ['query'],
+      ),
+    'getBoardLimitsBySession' : IDL.Func(
+        [IDL.Text, IDL.Text],
+        [Result_18],
         ['query'],
       ),
     'getDailyStats' : IDL.Func(
@@ -488,6 +520,7 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'getDeveloperContact' : IDL.Func([IDL.Principal], [Result_13], ['query']),
     'getDeveloperTier' : IDL.Func(
         [],
         [
@@ -510,17 +543,15 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
-    'getEntryDeletionLog' : IDL.Func([IDL.Text], [Result_16], ['query']),
-    'getEntryDeletionLogBySession' : IDL.Func(
-        [IDL.Text, IDL.Text],
-        [Result_16],
+    'getDisplayName' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Text],
+        [Result_13],
         ['query'],
       ),
-    'getFile' : IDL.Func([IDL.Text], [IDL.Opt(IDL.Vec(IDL.Nat8))], ['query']),
-    'getFileCount' : IDL.Func([], [IDL.Nat], ['query']),
-    'getFileInfo' : IDL.Func(
-        [IDL.Text],
-        [IDL.Opt(IDL.Record({ 'name' : IDL.Text, 'size' : IDL.Nat }))],
+    'getEntryDeletionLog' : IDL.Func([IDL.Text], [Result_17], ['query']),
+    'getEntryDeletionLogBySession' : IDL.Func(
+        [IDL.Text, IDL.Text],
+        [Result_17],
         ['query'],
       ),
     'getGame' : IDL.Func([IDL.Text], [IDL.Opt(GameInfo)], ['query']),
@@ -542,6 +573,13 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'getGameEngine' : IDL.Func([IDL.Text], [IDL.Opt(IDL.Text)], ['query']),
+    'getGameEngines' : IDL.Func(
+        [],
+        [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Text))],
+        ['query'],
+      ),
+    'getGameIntlNames' : IDL.Func([IDL.Text], [IDL.Bool], ['query']),
     'getGameOAuthConfig' : IDL.Func(
         [IDL.Text],
         [
@@ -558,12 +596,12 @@ export const idlFactory = ({ IDL }) => {
       ),
     'getGameOAuthConfigBySession' : IDL.Func(
         [IDL.Text, IDL.Text],
-        [Result_15],
+        [Result_16],
         ['query'],
       ),
     'getGameProfile' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Text],
-        [Result_14],
+        [Result_15],
         ['query'],
       ),
     'getGameTimeValidationRules' : IDL.Func(
@@ -578,6 +616,12 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
+    'getGameWebsite' : IDL.Func([IDL.Text], [IDL.Opt(IDL.Text)], ['query']),
+    'getGameWebsites' : IDL.Func(
+        [],
+        [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Text))],
+        ['query'],
+      ),
     'getGamesByOwner' : IDL.Func(
         [IDL.Principal],
         [IDL.Vec(GameInfo)],
@@ -586,7 +630,7 @@ export const idlFactory = ({ IDL }) => {
     'getGamesBySession' : IDL.Func([IDL.Text], [IDL.Vec(GameInfo)], ['query']),
     'getLastArchivedScoreboard' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Nat],
-        [Result_13],
+        [Result_14],
         ['query'],
       ),
     'getLeaderboard' : IDL.Func(
@@ -597,6 +641,12 @@ export const idlFactory = ({ IDL }) => {
     'getLeaderboardByAuth' : IDL.Func(
         [IDL.Text, AuthType, SortBy, IDL.Nat],
         [IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat64, IDL.Nat64, IDL.Text))],
+        ['query'],
+      ),
+    'getMyDeveloperContact' : IDL.Func([], [IDL.Opt(IDL.Text)], ['query']),
+    'getMyDeveloperContactBySession' : IDL.Func(
+        [IDL.Text],
+        [Result_13],
         ['query'],
       ),
     'getMyDeveloperTier' : IDL.Func(
@@ -768,7 +818,6 @@ export const idlFactory = ({ IDL }) => {
         [
           IDL.Record({
             'principalUserCount' : IDL.Nat,
-            'fileCount' : IDL.Nat,
             'totalEvents' : IDL.Nat,
             'gameCount' : IDL.Nat,
             'suspicionLogSize' : IDL.Nat,
@@ -780,7 +829,6 @@ export const idlFactory = ({ IDL }) => {
         ],
         ['query'],
       ),
-    'getTotalStorageUsed' : IDL.Func([], [IDL.Nat], ['query']),
     'getUserProfile' : IDL.Func([IDL.Text, IDL.Text], [Result_8], ['query']),
     'hasApiKey' : IDL.Func([IDL.Text], [IDL.Bool], ['query']),
     'hasApiKeyBySession' : IDL.Func(
@@ -795,11 +843,45 @@ export const idlFactory = ({ IDL }) => {
         [IDL.Bool],
         ['query'],
       ),
-    'listFiles' : IDL.Func([], [IDL.Vec(IDL.Text)], ['query']),
     'listGames' : IDL.Func([], [IDL.Vec(GameInfo)], ['query']),
+    'memStats' : IDL.Func(
+        [],
+        [
+          IDL.Record({
+            'lastPlayCounted' : IDL.Nat,
+            'status' : IDL.Text,
+            'principalToSession' : IDL.Nat,
+            'playSessions' : IDL.Nat,
+            'heapBytes' : IDL.Nat,
+            'scoreboardEntries' : IDL.Nat,
+            'scoreboardArchives' : IDL.Nat,
+            'cachedLeaderboards' : IDL.Nat,
+            'analyticsEvents' : IDL.Nat,
+            'cycles' : IDL.Nat,
+            'dailyStats' : IDL.Nat,
+            'playerStats' : IDL.Nat,
+            'games' : IDL.Nat,
+            'memoryBytes' : IDL.Nat,
+            'sessions' : IDL.Nat,
+            'entryDeletionLog' : IDL.Nat,
+            'users' : IDL.Nat,
+            'suspicionLog' : IDL.Nat,
+            'lastSubmitTime' : IDL.Nat,
+            'cachedScoreboards' : IDL.Nat,
+            'maxLiveBytes' : IDL.Nat,
+            'scoreboards' : IDL.Nat,
+          }),
+        ],
+        ['query'],
+      ),
     'migrateAnonymousAccount' : IDL.Func([IDL.Text, IDL.Text], [Result_5], []),
     'migrateAnonymousToII' : IDL.Func([IDL.Text], [Result_5], []),
     'permanentlyDeleteGame' : IDL.Func([IDL.Text], [Result_1], []),
+    'permanentlyDeleteGameBySession' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Text],
+        [Result_1],
+        [],
+      ),
     'recoverDeletedGame' : IDL.Func([IDL.Text], [Result_1], []),
     'recoverDeletedGameBySession' : IDL.Func(
         [IDL.Text, IDL.Text],
@@ -856,6 +938,12 @@ export const idlFactory = ({ IDL }) => {
         [Result_1],
         [],
       ),
+    'resetPlayerDisplayName' : IDL.Func([IDL.Text, IDL.Text], [Result_1], []),
+    'resetPlayerDisplayNameBySession' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Text],
+        [Result_1],
+        [],
+      ),
     'resetScoreboard' : IDL.Func([IDL.Text, IDL.Text], [Result_1], []),
     'resetScoreboardBySession' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Text],
@@ -864,6 +952,27 @@ export const idlFactory = ({ IDL }) => {
       ),
     'revokeApiKey' : IDL.Func([IDL.Text], [Result_1], []),
     'revokeApiKeyBySession' : IDL.Func([IDL.Text, IDL.Text], [Result_1], []),
+    'setBoardCapExempt' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Bool],
+        [Result_1],
+        [],
+      ),
+    'setBoardCapExemptBySession' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Text, IDL.Bool],
+        [Result_1],
+        [],
+      ),
+    'setDeveloperContact' : IDL.Func([IDL.Text], [Result_1], []),
+    'setDeveloperContactBySession' : IDL.Func(
+        [IDL.Text, IDL.Text],
+        [Result_1],
+        [],
+      ),
+    'setDisplayName' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Text, IDL.Opt(IDL.Text)],
+        [Result_4],
+        [],
+      ),
     'setGameAppleCredentials' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Opt(IDL.Text)],
         [Result_1],
@@ -871,6 +980,12 @@ export const idlFactory = ({ IDL }) => {
       ),
     'setGameAppleCredentialsBySession' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Text, IDL.Opt(IDL.Text)],
+        [Result_1],
+        [],
+      ),
+    'setGameEngine' : IDL.Func([IDL.Text, IDL.Text], [Result_1], []),
+    'setGameEngineBySession' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Text],
         [Result_1],
         [],
       ),
@@ -884,9 +999,21 @@ export const idlFactory = ({ IDL }) => {
         [Result_1],
         [],
       ),
+    'setGameIntlNames' : IDL.Func([IDL.Text, IDL.Bool], [Result_1], []),
+    'setGameIntlNamesBySession' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Bool],
+        [Result_1],
+        [],
+      ),
+    'setGameWebsite' : IDL.Func([IDL.Text, IDL.Text], [Result_1], []),
+    'setGameWebsiteBySession' : IDL.Func(
+        [IDL.Text, IDL.Text, IDL.Text],
+        [Result_1],
+        [],
+      ),
     'socialLoginAndGetProfile' : IDL.Func(
         [IDL.Text, IDL.Text, IDL.Text, IDL.Text],
-        [Result_4],
+        [Result_3],
         [],
       ),
     'startGameSession' : IDL.Func([IDL.Text], [Result_1], []),
@@ -926,19 +1053,6 @@ export const idlFactory = ({ IDL }) => {
           IDL.Opt(IDL.Text),
         ],
         [Result_1],
-        [],
-      ),
-    'submitScoreToScoreboard' : IDL.Func(
-        [
-          IDL.Text,
-          IDL.Text,
-          IDL.Text,
-          IDL.Text,
-          IDL.Nat,
-          IDL.Nat,
-          IDL.Opt(IDL.Text),
-        ],
-        [Result_3],
         [],
       ),
     'suggestNickname' : IDL.Func([], [Result_1], []),
@@ -1034,7 +1148,6 @@ export const idlFactory = ({ IDL }) => {
         [Result_1],
         [],
       ),
-    'uploadFile' : IDL.Func([IDL.Text, IDL.Vec(IDL.Nat8)], [Result_1], []),
     'validateApiKey' : IDL.Func([IDL.Text], [IDL.Opt(ApiKey)], []),
     'validateApiKeyQuery' : IDL.Func(
         [IDL.Text],
